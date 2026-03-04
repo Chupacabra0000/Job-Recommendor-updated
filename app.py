@@ -1,6 +1,5 @@
 import math
 import re
-import time
 import html as _html
 import hashlib
 from typing import Dict, List
@@ -12,16 +11,15 @@ import pandas as pd
 
 from db import (
     init_db, create_user, authenticate,
-    list_resumes, create_resume, delete_resume,
-    list_favorites, add_favorite, remove_favorite
+    list_resumes, list_favorites, add_favorite, remove_favorite,
+    create_session, get_user_by_token, delete_session
 )
-from hh_client import fetch_vacancies, vacancy_details
 
+from hh_client import fetch_vacancies, vacancy_details
 from sentence_transformers import SentenceTransformer
 
 from tfidf_terms import extract_terms
 from embedding_store import init_store, get_embedding, put_embedding
-
 from hh_areas import fetch_areas_tree, list_regions_and_cities
 
 # ---------- constants ----------
@@ -50,17 +48,38 @@ st.set_page_config(page_title="HH Job Recommender", page_icon="💼", layout="wi
 init_db()
 init_store()
 
+# ---------- styles ----------
+st.markdown(
+    """
+    <style>
+      .center-wrap { max-width: 520px; margin: 0 auto; }
+      .card { border: 1px solid rgba(49,51,63,.15); border-radius: 14px; padding: 16px 18px; margin-bottom: 14px; }
+      .pill { display: inline-block; padding: 2px 10px; border-radius: 999px;
+              border: 1px solid rgba(49,51,63,.2); margin-right: 6px; margin-top: 6px; font-size: 0.85rem; }
+      .pill-strong { font-weight: 600; }
+      .snippet { color: rgba(49,51,63,.82); font-size: 0.95rem; margin-top: 8px; }
+      .skill-chip { display: inline-block; margin: 4px 6px 0 0; padding: 2px 8px; border-radius: 999px;
+                    background: rgba(49,51,63,.06); font-size: 0.85rem; }
+      .muted { color: rgba(49,51,63,.65); }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # ---------- state ----------
 if "user" not in st.session_state:
     st.session_state.user = None
+
 if "page" not in st.session_state:
     st.session_state.page = 1
 if "page_size" not in st.session_state:
     st.session_state.page_size = 20
+
 if "resume_source" not in st.session_state:
     st.session_state.resume_source = "None"
 if "pdf_text" not in st.session_state:
     st.session_state.pdf_text = ""
+
 if "details_cache" not in st.session_state:
     st.session_state.details_cache = {}  # vacancy_id -> full_desc_text
 
@@ -70,13 +89,24 @@ if "terms_text" not in st.session_state:
 if "resume_hash_for_terms" not in st.session_state:
     st.session_state.resume_hash_for_terms = ""
 
-# manual fetch results state (so pagination/sorting doesn’t refetch)
+# manual fetch results state
 if "last_results_df" not in st.session_state:
-    st.session_state.last_results_df = None  # pd.DataFrame
+    st.session_state.last_results_df = None
 if "last_results_meta" not in st.session_state:
-    st.session_state.last_results_meta = {}  # store info about last fetch (area/terms/etc.)
+    st.session_state.last_results_meta = {}
+
+# bootstrap default vacancies once per session
 if "did_bootstrap_default" not in st.session_state:
     st.session_state.did_bootstrap_default = False
+
+# ---------- persistent login (URL token) ----------
+# If user refreshes the page, Streamlit starts a new session.
+# We restore user from token in query params.
+token = st.query_params.get("token", "")
+if st.session_state.user is None and token:
+    u = get_user_by_token(token)
+    if u:
+        st.session_state.user = u
 
 # ---------- helpers ----------
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
@@ -163,12 +193,23 @@ def _areas_cached():
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def _fetch_default_startup(area_id: int) -> List[dict]:
-    return fetch_vacancies(text=DEFAULT_QUERY, area=area_id, max_items=DEFAULT_STARTUP_LIMIT, per_page=50, period_days=None)
+    return fetch_vacancies(
+        text=DEFAULT_QUERY,
+        area=area_id,
+        max_items=DEFAULT_STARTUP_LIMIT,
+        per_page=50,
+        period_days=None
+    )
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def _fetch_term(area_id: int, term: str, per_term: int) -> List[dict]:
-    # 14-day freshness keeps results relevant and reduces noise
-    return fetch_vacancies(text=term, area=area_id, max_items=per_term, per_page=per_term, period_days=14)
+    return fetch_vacancies(
+        text=term,
+        area=area_id,
+        max_items=per_term,
+        per_page=per_term,
+        period_days=14
+    )
 
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def _fetch_details(vacancy_id: str) -> str:
@@ -241,11 +282,12 @@ def _chips(skills_text: str, limit: int = 10) -> List[str]:
             break
     return out
 
-
-# ---------- auth ----------
+# ---------- auth UI (centered) ----------
 def auth_screen():
+    st.markdown("<div class='center-wrap'>", unsafe_allow_html=True)
     st.markdown("## 🔐 Вход / Регистрация")
     t1, t2 = st.tabs(["Вход", "Регистрация"])
+
     with t1:
         email = st.text_input("Email", key="login_email")
         password = st.text_input("Пароль", type="password", key="login_password")
@@ -254,8 +296,12 @@ def auth_screen():
             if not user:
                 st.error("Неверный email или пароль.")
             else:
+                # Create persistent session token and store in URL
+                tok = create_session(int(user["id"]), days_valid=30)
+                st.query_params["token"] = tok
                 st.session_state.user = user
                 st.rerun()
+
     with t2:
         email_r = st.text_input("Email", key="reg_email")
         p1 = st.text_input("Пароль (мин. 6 символов)", type="password", key="reg_password")
@@ -267,22 +313,31 @@ def auth_screen():
                 ok, msg = create_user(email_r, p1)
                 st.success(msg) if ok else st.error(msg)
 
+    st.markdown("</div>", unsafe_allow_html=True)
+
 if st.session_state.user is None:
     auth_screen()
     st.stop()
 
 user_id = int(st.session_state.user["id"])
 
-
 # ---------- sidebar ----------
 st.sidebar.title("⚙️ Настройки")
+
+# Logout: delete session token and clear query param
 if st.sidebar.button("🚪 Выйти", use_container_width=True):
+    tok = st.query_params.get("token", "")
+    if tok:
+        delete_session(tok)
+    st.query_params.clear()
     st.session_state.user = None
+    st.session_state.last_results_df = None
+    st.session_state.did_bootstrap_default = False
     st.rerun()
 
 st.sidebar.subheader("Локация (HH Areas)")
-
 regions, cities_by_region_id = _areas_cached()
+
 region_names = [r["name"] for r in regions]
 region_name = st.sidebar.selectbox("Регион", region_names, index=0 if region_names else 0)
 region_obj = next((r for r in regions if r["name"] == region_name), None)
@@ -293,10 +348,9 @@ city_names = [c["name"] for c in cities]
 default_city_idx = 0
 if "Новосибирск" in city_names:
     default_city_idx = city_names.index("Новосибирск")
-
 city_name = st.sidebar.selectbox("Город", city_names, index=default_city_idx if city_names else 0)
 city_obj = next((c for c in cities if c["name"] == city_name), None)
-area_id = int(city_obj["id"]) if city_obj else 1  # fallback
+area_id = int(city_obj["id"]) if city_obj else 1
 
 st.sidebar.subheader("Резюме")
 resume_source = st.sidebar.radio("Источник резюме", ["None", "PDF resume", "Created resume"], index=0)
@@ -322,12 +376,10 @@ if resume_source == "PDF resume":
     resume_text = st.session_state.pdf_text
 elif resume_source == "Created resume":
     resume_text = selected_resume_text
-
 has_resume = bool((resume_text or "").strip())
 
 st.sidebar.subheader("Термины (TF-IDF)")
-
-# Auto-generate TF-IDF terms when resume changes, but DO NOT fetch until button pressed
+# auto-generate TF-IDF terms when resume changes (no HH calls)
 if has_resume:
     rh = hashlib.sha256(resume_text.encode("utf-8", errors="ignore")).hexdigest()
     if rh != st.session_state.resume_hash_for_terms:
@@ -368,20 +420,18 @@ st.sidebar.subheader("Показ")
 page_size = st.sidebar.selectbox("На странице", [10, 20, 50, 100], index=1)
 st.session_state.page_size = int(page_size)
 
-# ✅ Manual fetch button (the only trigger for network calls)
+# ✅ Manual trigger for HH fetch (after bootstrap)
 do_search = st.sidebar.button("Поиск", use_container_width=True)
-
 
 # ---------- header ----------
 st.title("💼 HH.ru Job Recommender")
-st.caption("Все запросы к HH выполняются **только** после нажатия кнопки **Поиск**.")
+st.caption("По умолчанию показываем 500 вакансий. Все последующие запросы к HH — только по кнопке **Поиск**.")
 
 favorites = set(list_favorites(user_id))
 
-
-# ---------- MAIN: manual fetch logic ----------
+# ---------- ACTION: manual search ----------
 if do_search:
-    # Clear details cache on new search (optional but cleaner)
+    # clear lazy details on new search
     st.session_state.details_cache = {}
 
     if not has_resume:
@@ -389,10 +439,8 @@ if do_search:
             items = _fetch_default_startup(int(area_id))
             df = _items_to_df(items)
         df["similarity_score"] = pd.NA
-
         st.session_state.last_results_df = df
-        st.session_state.last_results_meta = {"mode": "default", "area_id": area_id}
-
+        st.session_state.last_results_meta = {"mode": "default_manual", "area_id": int(area_id)}
     else:
         terms = [t.strip() for t in st.session_state.terms_text.splitlines() if t.strip()]
         terms = terms[:TERMS_MAX]
@@ -407,12 +455,10 @@ if do_search:
             df = _items_to_df(merged)
 
         model = SentenceTransformer(MODEL_NAME)
-
         with st.spinner("Эмбеддинги вакансий (reuse by vacancy_id) + FAISS ранжирование..."):
             job_embs = _build_embeddings_for_df(df, model)
             q = model.encode([resume_text], normalize_embeddings=True)
             q = np.asarray(q, dtype=np.float32)
-
             scores = _rank_with_faiss(job_embs, q)
             df["similarity_score"] = scores
             df = df.sort_values("similarity_score", ascending=False).reset_index(drop=True)
@@ -428,21 +474,17 @@ if do_search:
                         st.session_state.details_cache[vid] = ""
 
         st.session_state.last_results_df = df
-        st.session_state.last_results_meta = {"mode": "ranked", "area_id": area_id, "terms": terms}
+        st.session_state.last_results_meta = {"mode": "ranked_manual", "area_id": int(area_id), "terms": terms}
 
-    # reset pagination after new search
     st.session_state.page = 1
 
-
-# If no search yet, show a friendly message and nothing fetched
-# Bootstrap: show default vacancies on first run (once), then switch to manual refresh via "Поиск"
+# ---------- BOOTSTRAP: show default vacancies on startup automatically ----------
 if st.session_state.last_results_df is None:
     if not st.session_state.did_bootstrap_default:
         with st.spinner("Загружаем дефолтные вакансии (без эмбеддингов)..."):
             items = _fetch_default_startup(int(area_id))
             df0 = _items_to_df(items)
-            df0["similarity_score"] = pd.NA
-
+        df0["similarity_score"] = pd.NA
         st.session_state.last_results_df = df0
         st.session_state.last_results_meta = {"mode": "default_bootstrap", "area_id": int(area_id)}
         st.session_state.did_bootstrap_default = True
@@ -514,8 +556,7 @@ def render_job(row: Dict, idx: int):
         full_desc = ""
         if vid and vid in st.session_state.details_cache:
             full_desc = st.session_state.details_cache[vid]
-        elif vid and st.session_state.last_results_meta.get("mode") == "ranked" and idx > 10:
-            # fetch on click for 11+
+        elif vid and st.session_state.last_results_meta.get("mode", "").startswith("ranked") and idx > 10:
             with st.spinner("Подгружаем полное описание..."):
                 try:
                     full_desc = _fetch_details(vid)
@@ -529,7 +570,6 @@ def render_job(row: Dict, idx: int):
             st.caption("Полное описание не загружено (или отсутствует).")
 
     st.markdown("</div>", unsafe_allow_html=True)
-
 
 total = len(df)
 st.caption(f"Вакансий: {total}")
