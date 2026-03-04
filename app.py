@@ -75,6 +75,8 @@ if "last_results_df" not in st.session_state:
     st.session_state.last_results_df = None  # pd.DataFrame
 if "last_results_meta" not in st.session_state:
     st.session_state.last_results_meta = {}  # store info about last fetch (area/terms/etc.)
+if "did_bootstrap_default" not in st.session_state:
+    st.session_state.did_bootstrap_default = False
 
 # ---------- helpers ----------
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
@@ -433,9 +435,20 @@ if do_search:
 
 
 # If no search yet, show a friendly message and nothing fetched
+# Bootstrap: show default vacancies on first run (once), then switch to manual refresh via "Поиск"
 if st.session_state.last_results_df is None:
-    st.info("Заполните параметры в сайдбаре и нажмите **Поиск**. (Запросы к HH не выполняются автоматически.)")
-    st.stop()
+    if not st.session_state.did_bootstrap_default:
+        with st.spinner("Загружаем дефолтные вакансии (без эмбеддингов)..."):
+            items = _fetch_default_startup(int(area_id))
+            df0 = _items_to_df(items)
+            df0["similarity_score"] = pd.NA
+
+        st.session_state.last_results_df = df0
+        st.session_state.last_results_meta = {"mode": "default_bootstrap", "area_id": int(area_id)}
+        st.session_state.did_bootstrap_default = True
+    else:
+        st.info("Изменили параметры? Нажмите **Поиск**, чтобы обновить вакансии.")
+        st.stop()
 
 df = st.session_state.last_results_df.copy()
 
